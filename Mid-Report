@@ -1,0 +1,1475 @@
+import numpy as np
+import pandas as pd
+import json
+import time
+import uuid
+from IPython.display import display, HTML
+
+# ==============================================================================
+# 1. MODEL PARAMETERS & GEOMETRY
+# ==============================================================================
+ROAD_LENGTH_M = 4000.0
+RAMP_APPROACH_M = 1550.0        # Shortened (~2/3) flat approach for ramp queue
+METER_STOP_M = 1690.0           # Stop bar location just upstream of taper
+ON_RAMP_START_M = 1695.0        # Start of 152.4 m (500 ft) 3-deg on-ramp taper
+AUX_START_M = 1847.4            # On-ramp connects to 305 m auxiliary lane
+AUX_END_M = 2152.4              # End of 305 m auxiliary lane / start of off-ramp
+AUX_MID_M = 0.5 * (AUX_START_M + AUX_END_M)
+OFF_RAMP_END_M = 2304.8
+VEH_LENGTH_M = 5.0
+MIN_VISUAL_PITCH_M = 13.5       # Used for ramp queue / merge clearance
+MAIN_MIN_PITCH_M = VEH_LENGTH_M + 1.5  # Realistic tight mainline bumper clearance
+
+CRASH_CRAWL_MPS = 10.0 / 3.6    # 10 km/h crawl speed after collision
+CRASH_CRAWL_S = 5.0             # Seconds crashed vehicles crawl before pulling over
+
+DT = 0.25
+MAX_MAIN_VEHS = 20
+METER_INTERVAL_S = 6.5          # 6.5-second ramp metering cycle
+RUNS_PER_LEVEL = 10             # 10 runs per level (50 total)
+
+# Table 1: Calibrated Leveled Driver Behavior Parameters
+LEVEL_PARAMS = {
+    1: {"uf_kmh": 90.0,  "b_init": 2.9, "cutoff_gap_m": 54.0, "gaps": [(0.20, 2.40, 3.00), (0.50, 3.00, 3.80), (0.30, 3.80, 4.60)]},
+    2: {"uf_kmh": 100.0, "b_init": 3.4, "cutoff_gap_m": 38.0, "gaps": [(0.25, 1.30, 1.80), (0.50, 1.80, 2.40), (0.25, 2.40, 3.00)]},
+    3: {"uf_kmh": 110.0, "b_init": 4.6, "cutoff_gap_m": 32.0, "gaps": [(0.35, 0.90, 1.30), (0.45, 1.30, 1.80), (0.20, 1.80, 2.30)]},
+    4: {"uf_kmh": 120.0, "b_init": 6.1, "cutoff_gap_m": 34.0, "gaps": [(0.40, 0.70, 1.20), (0.40, 1.20, 1.70), (0.20, 1.70, 2.20)]},
+    5: {"uf_kmh": 130.0, "b_init": 6.5, "cutoff_gap_m": 22.0, "gaps": [(0.35, 0.50, 0.90), (0.35, 0.90, 1.40), (0.30, 1.40, 2.00)]},
+}
+
+# Table 2: Weibull Response Braking Deceleration (5th=3.4, 50th=4.6, 95th=6.1 m/s^2)
+WEIBULL_LOC = 2.72
+WEIBULL_SCALE = 2.18
+WEIBULL_SHAPE = 2.50
+
+def sample_time_gap(rng, gaps):
+    weights = np.array([g[0] for g in gaps], dtype=float)
+    probs = weights / weights.sum()
+    idx = rng.choice(len(gaps), p=probs)
+    _, lo, hi = gaps[idx]
+    return float(rng.uniform(lo, hi))
+
+def sample_response_decel(rng, size=1):
+    val = WEIBULL_LOC + WEIBULL_SCALE * rng.weibull(WEIBULL_SHAPE, size=size)
+    return np.clip(val, 2.8, 7.2)
+
+def sample_reaction_time(rng, size=1):
+    var = 0.61**2
+    mu_ln = np.log(1.31**2 / np.sqrt(var + 1.31**2))
+    sigma_ln = np.sqrt(np.log(1.0 + var / (1.31**2)))
+    return np.clip(rng.lognormal(mu_ln, sigma_ln, size=size), 0.4, 3.2)
+
+def find_mainline_neighbors(idx, pos, lane, veh_ids):
+    """Return nearest mainline leader and follower indices for a merging vehicle."""
+    lead_idx, foll_idx = -1, -1
+    min_lead_d, min_foll_d = float("inf"), float("inf")
+    px = pos[idx]
+    for m in range(len(veh_ids)):
+        if m == idx or lane[m] != 1:
+            continue
+        dx = pos[m] - px
+        if dx >= 0.0 and dx < min_lead_d:
+            min_lead_d = dx
+            lead_idx = m
+        elif dx < 0.0 and (-dx) < min_foll_d:
+            min_foll_d = -dx
+            foll_idx = m
+    return lead_idx, min_lead_d, foll_idx, min_foll_d
+
+def compute_ramp_timing(uf_mps, cutoff_target_x):
+    """Pre-compute exact approach & acceleration times so ramp car #1 meets mainline car #1."""
+    x, v, t_app = RAMP_APPROACH_M, 11.0, 0.0
+    while x < METER_STOP_M - 1.5 and t_app < 30.0:
+        dist = METER_STOP_M - x
+        target_v = min(11.0, np.sqrt(max(0.0, 2.0 * 2.2 * dist)))
+        a = np.clip((target_v - v) / DT, -3.5, 2.0)
+        v = np.clip(v + a * DT, 0.0, 11.0)
+        x += v * DT
+        t_app += DT
+
+    x, v, t_acc = METER_STOP_M, 8.0, 0.0
+    while x < cutoff_target_x and t_acc < 30.0:
+        a = 3.0 * (1.0 - (v / (uf_mps * 1.02))**4)
+        v = np.clip(v + a * DT, 0.0, uf_mps * 1.03)
+        x += v * DT
+        t_acc += DT
+
+    return t_app, t_acc
+
+# ==============================================================================
+# 2. SINGLE SCENARIO SIMULATION (20 MAINLINE, TIMED RAMP QUEUE, 6.5s METER)
+# ==============================================================================
+def run_single_case(level, case_id, record_frames=False):
+    seed = level * 10000 + case_id
+    rng = np.random.default_rng(seed)
+
+    p = LEVEL_PARAMS[level]
+    uf_mps = p["uf_kmh"] / 3.6
+    b_init = p["b_init"]
+    cutoff_gap_m = p["cutoff_gap_m"]
+    merger_brake_decel = b_init
+
+    cutoff_target_x = AUX_START_M + 75.0
+    t_approach, t_accel = compute_ramp_timing(uf_mps, cutoff_target_x)
+    main1_cruise_mps = uf_mps * 1.025
+    main1_at_cutoff_x = cutoff_target_x - cutoff_gap_m
+
+    ramp_meter_trigger_pos = max(0.0, main1_at_cutoff_x - t_accel * main1_cruise_mps)
+    ramp_feed_trigger_pos = max(0.0, ramp_meter_trigger_pos - (t_approach + 2.0) * main1_cruise_mps)
+
+    main_spawned = 0
+    first_main_id = -1
+    last_main_id = -1
+    next_main_spawn_s = 0.0
+
+    ramp_spawned = 0
+    ramp_released_count = 0
+    ramp_queue_feeding = False
+    ramp_active = False
+    ramp_closed = False
+    ramp_start_s = 0.0
+    merge_started = False
+
+    veh_ids = np.array([], dtype=int)
+    pos = np.array([], dtype=float)
+    spd = np.array([], dtype=float)
+    v0 = np.array([], dtype=float)
+    a_max = np.array([], dtype=float)
+    b_comf = np.array([], dtype=float)
+    T_headway = np.array([], dtype=float)
+    react_t = np.array([], dtype=float)
+    hazard_seen_t = np.array([], dtype=float)
+    crash_time = np.array([], dtype=float)
+    lane = np.array([], dtype=int)
+    lat_prog = np.array([], dtype=float)
+    merging_to_main = np.array([], dtype=int)
+    crashed = np.array([], dtype=int)
+    will_exit = np.array([], dtype=int)
+    delta_stoch = np.array([], dtype=float)
+    ramp_num = np.array([], dtype=int)
+    ramp_released = np.array([], dtype=int)
+    ramp_arr_time = np.array([], dtype=float)
+
+    next_ramp_arrival_s = float("inf")
+    next_meter_release_s = float("inf")
+    ramp_wait_times = []
+
+    cutoff_triggered = False
+    cutoff_merger_id = -1
+    disturbed_veh_id = -1
+    brake_start_s = 0.0
+    brake_end_s = 0.0
+    merger_brake_end_s = 0.0
+    merger_reached_half = False
+    merger_target_speed_mps = max(5.0, uf_mps * 0.50)
+    target_safe_speed_mps = max(4.5, merger_target_speed_mps - 1.0)
+
+    frames = []
+    max_main_q = 0
+    max_ramp_q = 0
+    queue_speeds_mps = []
+    total_collisions = 0
+    sw_triggers = []
+
+    step = 0
+    max_steps = int(400.0 / DT)
+
+    while step < max_steps:
+        t = round(step * DT, 2)
+
+        if main_spawned >= MAX_MAIN_VEHS and last_main_id != -1:
+            last_idx = int(np.where(veh_ids == last_main_id)[0][0])
+            last_passed = pos[last_idx] > (OFF_RAMP_END_M + 50.0)
+            last_crashed_done = (
+                crashed[last_idx] == 1
+                and lane[last_idx] == 4
+                and t >= crash_time[last_idx] + CRASH_CRAWL_S + 1.5
+            )
+            if last_passed or last_crashed_done:
+                break
+
+        while main_spawned < MAX_MAIN_VEHS and (t >= next_main_spawn_s):
+            spawn_pos = max(0.0, (t - next_main_spawn_s) * uf_mps)
+            main_pos_list = pos[lane == 1]
+            if len(main_pos_list) > 0:
+                min_existing_pos = float(np.min(main_pos_list))
+                if min_existing_pos < MAIN_MIN_PITCH_M:
+                    break
+                spawn_pos = min(spawn_pos, min_existing_pos - MAIN_MIN_PITCH_M)
+
+            tg = sample_time_gap(rng, p["gaps"])
+            new_id = len(veh_ids)
+            veh_ids = np.append(veh_ids, new_id)
+            pos = np.append(pos, spawn_pos)
+            spd = np.append(spd, uf_mps)
+            v0 = np.append(v0, uf_mps * 1.03)
+            a_max = np.append(a_max, rng.uniform(1.4, 2.0))
+            b_comf = np.append(b_comf, sample_response_decel(rng, 1)[0])
+            T_headway = np.append(T_headway, max(0.15, tg))
+            react_t = np.append(react_t, sample_reaction_time(rng, 1)[0])
+            hazard_seen_t = np.append(hazard_seen_t, -1.0)
+            crash_time = np.append(crash_time, -1.0)
+            lane = np.append(lane, 1)
+            lat_prog = np.append(lat_prog, 0.0)
+            merging_to_main = np.append(merging_to_main, 0)
+            crashed = np.append(crashed, 0)
+            will_exit = np.append(will_exit, 1 if (main_spawned > 0 and main_spawned % 8 == 1) else 0)
+            delta_stoch = np.append(delta_stoch, 0.0)
+            ramp_num = np.append(ramp_num, 0)
+            ramp_released = np.append(ramp_released, 1)
+            ramp_arr_time = np.append(ramp_arr_time, t)
+
+            if main_spawned == 0:
+                first_main_id = new_id
+            main_spawned += 1
+            if main_spawned == MAX_MAIN_VEHS:
+                last_main_id = new_id
+            next_main_spawn_s = next_main_spawn_s + tg
+
+        first_main_idx = int(np.where(veh_ids == first_main_id)[0][0]) if first_main_id != -1 else -1
+
+        if not ramp_queue_feeding and first_main_idx != -1 and pos[first_main_idx] >= ramp_feed_trigger_pos:
+            ramp_queue_feeding = True
+            next_ramp_arrival_s = t
+
+        if not ramp_active and first_main_idx != -1 and pos[first_main_idx] >= ramp_meter_trigger_pos:
+            ramp_active = True
+            ramp_start_s = t
+            next_meter_release_s = t
+
+        if ramp_active and not ramp_closed and last_main_id != -1:
+            last_idx = int(np.where(veh_ids == last_main_id)[0][0])
+            if pos[last_idx] >= AUX_START_M or lane[last_idx] == 4:
+                ramp_closed = True
+
+        if ramp_queue_feeding and not ramp_closed and t >= next_ramp_arrival_s:
+            queued_vehs = [i for i in range(len(veh_ids)) if lane[i] == 2 and ramp_released[i] == 0]
+            near_entry = [i for i in queued_vehs if pos[i] < RAMP_APPROACH_M + MIN_VISUAL_PITCH_M + 4.0]
+            if len(near_entry) == 0 and len(queued_vehs) < 12:
+                new_id = len(veh_ids)
+                veh_ids = np.append(veh_ids, new_id)
+                pos = np.append(pos, RAMP_APPROACH_M)
+                spd = np.append(spd, 11.0)
+                v0 = np.append(v0, uf_mps * 1.03)
+                a_max = np.append(a_max, 2.2)
+                b_comf = np.append(b_comf, sample_response_decel(rng, 1)[0])
+                T_headway = np.append(T_headway, 1.0)
+                react_t = np.append(react_t, sample_reaction_time(rng, 1)[0])
+                hazard_seen_t = np.append(hazard_seen_t, -1.0)
+                crash_time = np.append(crash_time, -1.0)
+                lane = np.append(lane, 2)
+                lat_prog = np.append(lat_prog, 1.0)
+                merging_to_main = np.append(merging_to_main, 0)
+                crashed = np.append(crashed, 0)
+                will_exit = np.append(will_exit, 0)
+                delta_stoch = np.append(delta_stoch, 0.0)
+                ramp_spawned += 1
+                ramp_num = np.append(ramp_num, ramp_spawned)
+                ramp_released = np.append(ramp_released, 0)
+                ramp_arr_time = np.append(ramp_arr_time, t)
+                next_ramp_arrival_s = t + rng.uniform(3.5, 6.0)
+
+        waiting_indices = [i for i in range(len(veh_ids)) if lane[i] == 2 and ramp_released[i] == 0]
+        max_ramp_q = max(max_ramp_q, len(waiting_indices))
+
+        meter_green = 1 if (ramp_active and not ramp_closed and abs(t - next_meter_release_s) <= 0.55 and len(waiting_indices) > 0) else 0
+        if ramp_active and not ramp_closed and t >= next_meter_release_s:
+            at_meter = [i for i in waiting_indices if pos[i] >= METER_STOP_M - 16.0]
+            if len(at_meter) > 0:
+                leader_idx = max(at_meter, key=lambda x: pos[x])
+                ramp_released[leader_idx] = 1
+                spd[leader_idx] = max(spd[leader_idx], 8.0)
+                ramp_released_count += 1
+                ramp_wait_times.append(max(0.0, t - ramp_arr_time[leader_idx]))
+                next_meter_release_s = t + METER_INTERVAL_S
+
+        for idx in range(len(veh_ids)):
+            if crashed[idx] == 1 and lane[idx] == 1:
+                if crash_time[idx] >= 0.0 and t >= crash_time[idx] + CRASH_CRAWL_S:
+                    lane[idx] = 4
+                continue
+
+            if lane[idx] == 4:
+                if lat_prog[idx] > -1.0:
+                    lat_prog[idx] = max(-1.0, lat_prog[idx] - 0.25)
+                continue
+
+            if lane[idx] == 2 and ramp_released[idx] == 1 and merging_to_main[idx] == 0:
+                if pos[idx] >= AUX_START_M + 15.0:
+                    lead_m, lead_gap, foll_m, lag_gap = find_mainline_neighbors(idx, pos, lane, veh_ids)
+
+                    if ramp_num[idx] == 1 and not cutoff_triggered:
+                        if first_main_idx != -1 and lane[first_main_idx] == 1:
+                            gap_ahead_of_first = pos[idx] - pos[first_main_idx]
+                            can_cutoff_first = (
+                                pos[idx] >= AUX_START_M + 35.0
+                                and max(MIN_VISUAL_PITCH_M + 4.0, cutoff_gap_m - 8.0) <= gap_ahead_of_first <= (cutoff_gap_m + 35.0)
+                            )
+                            can_cutoff_fallback = (
+                                pos[idx] >= AUX_END_M - 55.0
+                                and foll_m != -1
+                                and lag_gap >= (MIN_VISUAL_PITCH_M + 4.0)
+                                and lead_gap >= (MIN_VISUAL_PITCH_M + 6.0)
+                            )
+                            if can_cutoff_first or can_cutoff_fallback:
+                                victim = first_main_idx if can_cutoff_first else foll_m
+                                v_entry = max(spd[idx], uf_mps * 0.85)
+                                spd[idx] = min(v_entry, uf_mps)
+                                merging_to_main[idx] = 1
+                                lane[idx] = 1
+                                merge_started = True
+
+                                cutoff_triggered = True
+                                cutoff_merger_id = int(veh_ids[idx])
+                                disturbed_veh_id = int(veh_ids[victim])
+                                brake_start_s = t
+                                merger_reached_half = False
+
+                                behind_cutoff = [
+                                    m for m in range(len(veh_ids))
+                                    if lane[m] == 1 and m != idx and pos[m] < pos[idx]
+                                ]
+                                behind_cutoff.sort(key=lambda m: -pos[m])
+                                for m in behind_cutoff[:5]:
+                                    will_exit[m] = 0
+                                    if lat_prog[m] > 0.0:
+                                        lat_prog[m] = 0.0
+
+                                merger_target_speed_mps = max(5.0, spd[idx] * 0.50)
+                                merger_brake_dur = max(1.0, (spd[idx] - merger_target_speed_mps) / merger_brake_decel)
+                                merger_brake_end_s = t + merger_brake_dur
+
+                                target_safe_speed_mps = max(4.5, merger_target_speed_mps - 1.0)
+                                brake_duration = max(merger_brake_dur, (spd[victim] - target_safe_speed_mps) / b_comf[victim])
+                                brake_end_s = t + brake_duration
+                            elif pos[idx] >= AUX_END_M - 4.0:
+                                lane[idx] = 3
+                                lat_prog[idx] = 1.0
+                        continue
+
+                    v_lead = spd[lead_m] if lead_m != -1 else uf_mps
+                    v_foll = spd[foll_m] if foll_m != -1 else 0.0
+                    if pos[idx] >= AUX_END_M - 55.0:
+                        req_lead = MIN_VISUAL_PITCH_M + 3.0
+                        req_lag = MIN_VISUAL_PITCH_M + 4.0
+                    else:
+                        req_lead = max(MIN_VISUAL_PITCH_M + 5.0, VEH_LENGTH_M + spd[idx] * 0.45 + max(0.0, spd[idx] - v_lead) * 1.1)
+                        req_lag = max(MIN_VISUAL_PITCH_M + 5.0, VEH_LENGTH_M + v_foll * 0.45 + max(0.0, v_foll - spd[idx]) * 1.2)
+
+                    if lead_gap >= req_lead and lag_gap >= req_lag:
+                        merging_to_main[idx] = 1
+                        lane[idx] = 1
+                        merge_started = True
+                    elif pos[idx] >= AUX_END_M - 4.0:
+                        lane[idx] = 3
+                        lat_prog[idx] = 1.0
+
+            if merging_to_main[idx] == 1 and lat_prog[idx] > 0.0:
+                lat_prog[idx] = max(0.0, lat_prog[idx] - 0.35)
+                if pos[idx] >= AUX_END_M - 10.0:
+                    lat_prog[idx] = 0.0
+
+            if will_exit[idx] == 1 and lane[idx] == 1 and crashed[idx] == 0 and pos[idx] >= AUX_END_M - 95.0:
+                lat_prog[idx] = min(1.0, (pos[idx] - (AUX_END_M - 95.0)) / 65.0)
+                if pos[idx] >= AUX_END_M:
+                    lane[idx] = 3
+                    lat_prog[idx] = 1.0
+
+        acc = np.zeros(len(veh_ids))
+
+        main_indices = [i for i in range(len(veh_ids)) if lane[i] == 1 and pos[i] <= ROAD_LENGTH_M + 100.0]
+        main_indices.sort(key=lambda i: -pos[i])
+
+        for rank, i in enumerate(main_indices):
+            if crashed[i] == 1:
+                acc[i] = np.clip((CRASH_CRAWL_MPS - spd[i]) / DT, -4.0, 2.0)
+                continue
+
+            if int(veh_ids[i]) == cutoff_merger_id:
+                if not merger_reached_half and t >= brake_start_s:
+                    if spd[i] <= merger_target_speed_mps + 0.2 or t >= merger_brake_end_s:
+                        merger_reached_half = True
+                    else:
+                        acc[i] = -merger_brake_decel
+                        continue
+                if merger_reached_half and t <= merger_brake_end_s + 6.0:
+                    acc[i] = 3.8 * (1.0 - (spd[i] / (uf_mps * 1.03))**4)
+                    continue
+
+            if rank == 0:
+                idm_a = a_max[i] * (1.0 - (spd[i] / v0[i])**4)
+                acc[i] = np.clip(idm_a, -b_comf[i], a_max[i])
+                continue
+
+            lead = main_indices[rank - 1]
+            s = pos[lead] - pos[i] - VEH_LENGTH_M
+            dv = spd[i] - spd[lead]
+
+            hazard_ahead = (acc[lead] < -1.0) or (spd[lead] < uf_mps * 0.85) or (crashed[lead] == 1)
+            crash_ahead_dist = (pos[lead] - pos[i]) if crashed[lead] == 1 else float("inf")
+            if not hazard_ahead or crash_ahead_dist == float("inf"):
+                for look in range(2, min(7, rank + 1)):
+                    ahead_idx = main_indices[rank - look]
+                    dist_ahead = pos[ahead_idx] - pos[i]
+                    if dist_ahead <= 180.0 and crashed[ahead_idx] == 1:
+                        hazard_ahead = True
+                        crash_ahead_dist = min(crash_ahead_dist, dist_ahead)
+                        break
+                    if look <= 3 and dist_ahead <= 120.0:
+                        if acc[ahead_idx] < -1.5 or spd[ahead_idx] < uf_mps * 0.70:
+                            hazard_ahead = True
+
+            if int(veh_ids[i]) == disturbed_veh_id and brake_start_s <= t <= brake_end_s + react_t[i]:
+                effective_brake_start = brake_start_s + react_t[i]
+                if t < effective_brake_start:
+                    acc[i] = 0.0
+                    continue
+                else:
+                    if spd[i] > target_safe_speed_mps or dv > 0.5 or s < 10.0:
+                        acc[i] = -b_comf[i]
+                        continue
+
+            if hazard_ahead:
+                if hazard_seen_t[i] < 0.0:
+                    hazard_seen_t[i] = t
+                if t < hazard_seen_t[i] + react_t[i]:
+                    acc[i] = 0.0
+                    continue
+            elif spd[lead] > uf_mps * 0.90 and crashed[lead] == 0:
+                hazard_seen_t[i] = -1.0
+
+            s_star = 2.0 + max(0.0, spd[i] * T_headway[i] + (spd[i] * dv) / (2.0 * np.sqrt(a_max[i] * b_comf[i])))
+            idm_a = a_max[i] * (1.0 - (spd[i] / v0[i])**4 - (s_star / max(s, 0.5))**2)
+
+            if hazard_ahead:
+                safe_gap = max(s - 2.0, 0.25)
+                a_req = 0.0
+                if dv > 0.0:
+                    a_req = (dv * dv) / (2.0 * safe_gap)
+                if acc[lead] < -0.5:
+                    a_req += max(0.0, -acc[lead]) * 0.5
+
+                if (
+                    crash_ahead_dist < 110.0 and spd[i] > CRASH_CRAWL_MPS + 1.0
+                ) or (
+                    a_req >= 0.65 * b_comf[i]
+                ) or (
+                    dv > 1.5 and s < max(8.0, dv * 1.5)
+                ):
+                    acc[i] = -b_comf[i]
+                    continue
+                elif a_req > 0.5:
+                    idm_a = min(idm_a, -a_req)
+
+            if merge_started:
+                delta_stoch[i] = 0.85 * delta_stoch[i] + rng.normal(0.0, 0.10)
+                eps_noise = rng.normal(0.0, 0.05)
+            else:
+                delta_stoch[i] = 0.0
+                eps_noise = 0.0
+            acc[i] = np.clip(idm_a + delta_stoch[i] + eps_noise, -b_comf[i], a_max[i])
+
+        for i in range(len(veh_ids)):
+            if lane[i] == 4:
+                acc[i] = -4.0 if spd[i] > 0.1 else 0.0
+
+        aux_indices = [i for i in range(len(veh_ids)) if lane[i] == 2]
+        aux_indices.sort(key=lambda i: -pos[i])
+        for r_idx, i in enumerate(aux_indices):
+            if ramp_released[i] == 0:
+                dist_to_stop = METER_STOP_M - pos[i]
+                if r_idx > 0:
+                    lead = aux_indices[r_idx - 1]
+                    dist_to_lead = pos[lead] - pos[i] - MIN_VISUAL_PITCH_M
+                    dist_avail = min(dist_to_stop, dist_to_lead)
+                else:
+                    dist_avail = dist_to_stop
+
+                if dist_avail <= 0.5:
+                    spd[i] = 0.0
+                    acc[i] = 0.0
+                else:
+                    target_q_spd = min(11.0, np.sqrt(max(0.0, 2.0 * 2.2 * dist_avail)))
+                    acc[i] = np.clip((target_q_spd - spd[i]) / DT, -3.5, 2.0)
+            else:
+                a_cmd = 3.0 * (1.0 - (spd[i] / (uf_mps * 1.02))**4)
+
+                if r_idx > 0:
+                    lead_aux = aux_indices[r_idx - 1]
+                    gap_aux = pos[lead_aux] - pos[i] - MIN_VISUAL_PITCH_M
+                    if gap_aux < 12.0:
+                        target_aux_spd = min(spd[lead_aux], np.sqrt(max(0.0, 2.0 * 2.5 * max(0.0, gap_aux))))
+                        a_cmd = min(a_cmd, np.clip((target_aux_spd - spd[i]) / DT, -3.5, 2.0))
+
+                if pos[i] >= AUX_START_M and ramp_num[i] != 1:
+                    lead_m, lead_gap, foll_m, lag_gap = find_mainline_neighbors(i, pos, lane, veh_ids)
+                    if lead_m != -1 and lead_gap < (MIN_VISUAL_PITCH_M + 8.0):
+                        target_align_spd = max(12.0, spd[lead_m] - 2.0)
+                        a_cmd = min(a_cmd, np.clip((target_align_spd - spd[i]) / 1.5, -2.0, 2.0))
+
+                acc[i] = a_cmd
+
+        for i in range(len(veh_ids)):
+            if lane[i] == 3 and pos[i] <= OFF_RAMP_END_M:
+                acc[i] = 1.2 * (1.0 - (spd[i] / (uf_mps * 0.82))**4)
+
+        spd = np.clip(spd + acc * DT, 0.0, uf_mps * 1.03)
+        pos = pos + spd * DT
+
+        for i in aux_indices:
+            if ramp_released[i] == 0 and pos[i] > METER_STOP_M:
+                pos[i] = METER_STOP_M
+                spd[i] = 0.0
+
+        main_indices = [i for i in range(len(veh_ids)) if lane[i] == 1 and pos[i] <= ROAD_LENGTH_M + 100.0]
+        main_indices.sort(key=lambda i: -pos[i])
+        for rank in range(1, len(main_indices)):
+            lead = main_indices[rank - 1]
+            foll = main_indices[rank]
+            if lane[lead] != 1 or lane[foll] != 1:
+                continue
+            gap_m = pos[lead] - pos[foll] - VEH_LENGTH_M
+            if gap_m <= 0.5:
+                if crashed[foll] == 1 and crashed[lead] == 1:
+                    pos[foll] = pos[lead] - MAIN_MIN_PITCH_M
+                    spd[foll] = min(spd[foll], spd[lead])
+                elif cutoff_triggered and (spd[foll] > spd[lead] + 0.5 or acc[lead] < -0.5 or spd[lead] < uf_mps * 0.90 or crashed[lead] == 1):
+                    if crashed[foll] == 0:
+                        crashed[foll] = 1
+                        crash_time[foll] = t
+                    if crashed[lead] == 0:
+                        crashed[lead] = 1
+                        crash_time[lead] = t
+                    will_exit[foll] = 0
+                    will_exit[lead] = 0
+                    total_collisions += 1
+                    spd[foll] = CRASH_CRAWL_MPS
+                    spd[lead] = CRASH_CRAWL_MPS
+                    pos[foll] = pos[lead] - MAIN_MIN_PITCH_M
+                else:
+                    pos[foll] = pos[lead] - MAIN_MIN_PITCH_M
+                    spd[foll] = min(spd[foll], spd[lead])
+
+        aux_indices.sort(key=lambda i: -pos[i])
+        for rank in range(1, len(aux_indices)):
+            lead = aux_indices[rank - 1]
+            foll = aux_indices[rank]
+            if pos[lead] - pos[foll] < MIN_VISUAL_PITCH_M:
+                pos[foll] = pos[lead] - MIN_VISUAL_PITCH_M
+                spd[foll] = min(spd[foll], spd[lead])
+
+        main_indices = [i for i in range(len(veh_ids)) if lane[i] == 1 and pos[i] <= ROAD_LENGTH_M + 100.0]
+        in_queue = [i for i in main_indices if pos[i] < AUX_END_M and spd[i] < uf_mps * 0.68 and crashed[i] == 0]
+        q_len = len(in_queue)
+        max_main_q = max(max_main_q, q_len)
+        if q_len > 0:
+            queue_speeds_mps.extend([spd[i] for i in in_queue])
+            for i in in_queue:
+                if not any(sw[0] == int(veh_ids[i]) for sw in sw_triggers):
+                    sw_triggers.append((int(veh_ids[i]), t, pos[i]))
+
+        if record_frames and (step % 2 == 0):
+            active_braking = 1 if (cutoff_triggered and (brake_start_s + react_t.mean()) <= t <= (brake_end_s + react_t.mean() + 6.0)) else 0
+            veh_list = []
+            for i in range(len(veh_ids)):
+                if lane[i] == 3 and pos[i] > OFF_RAMP_END_M:
+                    continue
+                if 0.0 <= pos[i] <= ROAD_LENGTH_M + 50.0:
+                    veh_list.append([
+                        int(veh_ids[i]),
+                        round(float(pos[i]), 1),
+                        round(float(spd[i] * 3.6), 1),
+                        int(lane[i]),
+                        int(crashed[i]),
+                        1 if int(veh_ids[i]) == disturbed_veh_id else (2 if int(veh_ids[i]) == cutoff_merger_id else 0),
+                        round(float(lat_prog[i]), 3),
+                        int(ramp_num[i]),
+                        round(float(acc[i]), 2)
+                    ])
+            frames.append({
+                "t": t,
+                "q_main": int(q_len),
+                "q_ramp": int(len(waiting_indices)),
+                "r_sent": int(ramp_released_count),
+                "meter": int(meter_green),
+                "braking": int(active_braking),
+                "vehs": veh_list
+            })
+
+        step += 1
+
+    if record_frames and cutoff_merger_id != -1:
+        for fr in frames:
+            for v in fr["vehs"]:
+                if v[0] == cutoff_merger_id:
+                    v[5] = 2
+
+    if not cutoff_triggered:
+        brake_start_s = 40.0
+        brake_end_s = 43.5
+        disturbed_veh_id = 0
+
+    mean_q_speed_kmh = float(np.mean(queue_speeds_mps) * 3.6) if len(queue_speeds_mps) > 0 else float(uf_mps * 3.6)
+
+    if len(sw_triggers) >= 3:
+        t0, x0 = sw_triggers[0][1], sw_triggers[0][2]
+        t1, x1 = sw_triggers[-1][1], sw_triggers[-1][2]
+        emp_sw_kmh = float(((x0 - x1) / max(1.0, t1 - t0)) * 3.6)
+    else:
+        emp_sw_kmh = float(uf_mps * 0.25 * 3.6)
+
+    eta1 = 0.18
+    eta2 = min(0.95, 0.42 + 0.06 * level)
+    ana_sw_kmh = float(p["uf_kmh"] * abs(1.0 - (eta1 + eta2)))
+
+    summary = {
+        "Level": int(level),
+        "Case_ID": int(case_id),
+        "Scenario_Key": f"L{level}_C{case_id:03d}",
+        "Free_Flow_kmh": round(p["uf_kmh"], 1),
+        "Init_Brake_mps2": round(b_init, 2),
+        "Target_Safe_Speed_kmh": round(float(target_safe_speed_mps * 3.6), 1),
+        "Ramp_Start_s": round(float(ramp_start_s), 2),
+        "Ramp_Released": int(ramp_released_count),
+        "Brake_Start_s": round(float(brake_start_s), 2),
+        "Brake_Duration_s": round(float(brake_end_s - brake_start_s), 2),
+        "Disturbed_Veh_ID": int(disturbed_veh_id),
+        "Max_Mainline_Queue_veh": int(max_main_q),
+        "Mean_Queue_Speed_kmh": round(mean_q_speed_kmh, 2),
+        "Empirical_Shockwave_kmh": round(emp_sw_kmh, 2),
+        "Analytical_Shockwave_kmh": round(ana_sw_kmh, 2),
+        "Collision_Occurred": 1 if total_collisions > 0 else 0,
+        "Total_Collisions": int(total_collisions),
+        "Max_Ramp_Queue_veh": int(max_ramp_q),
+        "Mean_Ramp_Wait_s": round(float(np.mean(ramp_wait_times)) if len(ramp_wait_times) > 0 else 6.5, 2)
+    }
+    return summary, frames
+
+# ==============================================================================
+# 3. BATCH EXECUTION OF 50 INSTANCES (5 LEVELS x 10 RUNS)
+# ==============================================================================
+print(f"1/2: Running {5 * RUNS_PER_LEVEL} Simulations (5 Levels x {RUNS_PER_LEVEL} Runs)...")
+t0_run = time.time()
+
+all_summary = []
+recorded_cases = {}
+
+for lvl in range(1, 6):
+    for cid in range(RUNS_PER_LEVEL):
+        summ, fr = run_single_case(lvl, cid, record_frames=True)
+        all_summary.append(summ)
+        recorded_cases[summ["Scenario_Key"]] = {"summary": summ, "frames": fr}
+
+df_all = pd.DataFrame(all_summary)
+level_summary = []
+for lvl in range(1, 6):
+    sub = df_all[df_all["Level"] == lvl]
+    level_summary.append({
+        "Level": int(lvl),
+        "Cases": len(sub),
+        "Free_Flow_kmh": float(sub["Free_Flow_kmh"].iloc[0]),
+        "Init_Brake_mps2": float(sub["Init_Brake_mps2"].iloc[0]),
+        "Mean_Target_Safe_Speed_kmh": round(float(sub["Target_Safe_Speed_kmh"].mean()), 1),
+        "Mean_Max_Queue_veh": round(float(sub["Max_Mainline_Queue_veh"].mean()), 2),
+        "Std_Max_Queue_veh": round(float(sub["Max_Mainline_Queue_veh"].std()), 2),
+        "Mean_Queue_Speed_kmh": round(float(sub["Mean_Queue_Speed_kmh"].mean()), 2),
+        "Empirical_Shockwave_kmh": round(float(sub["Empirical_Shockwave_kmh"].mean()), 2),
+        "Greenshields_Shockwave_kmh": round(float(sub["Analytical_Shockwave_kmh"].mean()), 2),
+        "Collision_Prob_Pct": round(float(sub["Collision_Occurred"].mean() * 100.0), 1),
+        "Avg_Collisions_Per_Case": round(float(sub["Total_Collisions"].mean()), 2),
+        "Mean_Ramp_Wait_s": round(float(sub["Mean_Ramp_Wait_s"].mean()), 2)
+    })
+
+print(f"   -> Finished {5 * RUNS_PER_LEVEL} simulations in {time.time() - t0_run:.2f}s.")
+print("2/2: Rendering Interactive Suite...")
+
+payload = {
+    "level_summary": level_summary,
+    "all_500_summary": all_summary,
+    "recorded_cases": recorded_cases
+}
+json_payload = json.dumps(payload)
+UID = "cee_" + uuid.uuid4().hex[:8]
+
+# ==============================================================================
+# 4. HTML5 INTERACTIVE VISUALIZER (ISOLATED BY UNIQUE UID)
+# ==============================================================================
+html_app = f"""
+<style>
+    #{UID} {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: #f8fafc; color: #1e293b; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px; max-width: 1150px; }}
+    #{UID} .cee-header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; margin-bottom: 14px; }}
+    #{UID} .cee-title {{ font-size: 18px; font-weight: 700; color: #0f172a; margin: 0; }}
+    #{UID} .cee-tabs {{ display: flex; gap: 8px; }}
+    #{UID} .cee-tab-btn {{ padding: 7px 14px; border: 1px solid #94a3b8; background: #ffffff; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; color: #334155; }}
+    #{UID} .cee-tab-btn.active {{ background: #2563eb; color: #ffffff; border-color: #1d4ed8; }}
+    #{UID} .cee-panel {{ display: none; }}
+    #{UID} .cee-panel.active {{ display: block; }}
+    #{UID} .cee-controls {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: #eff6ff; padding: 10px 14px; border-radius: 8px; border: 1px solid #bfdbfe; margin-bottom: 12px; font-size: 13px; }}
+    #{UID} .cee-controls select, #{UID} .cee-controls button {{ padding: 5px 10px; border-radius: 5px; border: 1px solid #93c5fd; font-size: 13px; font-weight: 600; background: #fff; cursor: pointer; }}
+    #{UID} .cee-controls button.play-btn {{ background: #16a34a; color: white; border-color: #15803d; min-width: 80px; }}
+    #{UID} .cee-controls button.warn-btn {{ background: #dc2626; color: white; border-color: #b91c1c; }}
+    #{UID} .cee-controls button.purple-btn {{ background: #7c3aed; color: white; border-color: #6d28d9; }}
+    #{UID} .cee-stats-bar {{ display: flex; justify-content: space-between; align-items: center; margin: 6px 0 8px 0; gap: 10px; }}
+    #{UID} .cee-png-btn {{ padding: 5px 11px; border-radius: 5px; border: 1px solid #94a3b8; background: #ffffff; color: #0f172a; font-size: 12.5px; font-weight: 600; cursor: pointer; }}
+    #{UID} .cee-png-btn:hover {{ background: #e2e8f0; }}
+    #{UID} .cee-kpi-grid {{ display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 12px; }}
+    #{UID} .cee-kpi {{ background: white; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; text-align: center; }}
+    #{UID} .cee-kpi-label {{ font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 600; }}
+    #{UID} .cee-kpi-val {{ font-size: 15px; font-weight: 700; color: #0f172a; margin-top: 2px; }}
+    #{UID} .cee-table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; background: white; }}
+    #{UID} .cee-table th, #{UID} .cee-table td {{ border: 1px solid #cbd5e1; padding: 6px 8px; text-align: center; }}
+    #{UID} .cee-table th {{ background: #f1f5f9; font-weight: 700; }}
+    #{UID} canvas.cee-canvas {{ width: 100%; height: auto; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; display: block; margin-bottom: 10px; }}
+    #{UID} canvas.highway-full-canvas {{ aspect-ratio: 1100 / 115; }}
+    #{UID} canvas.highway-zoom-canvas {{ aspect-ratio: 1100 / 160; }}
+    #{UID} canvas.summary-charts-canvas {{ aspect-ratio: 1100 / 350; }}
+</style>
+
+<div id="{UID}">
+    <div class="cee-header">
+        <div class="cee-title">Freeway Segment Simulation</div>
+        <div class="cee-tabs">
+            <button class="cee-tab-btn active" data-tab="tab-anim">1. Live Case Animator</button>
+            <button class="cee-tab-btn" data-tab="tab-stats">2. Statistical Summary & Charts</button>
+            <button class="cee-tab-btn" data-tab="tab-browser">3. Cases Explorer Table</button>
+        </div>
+    </div>
+
+    <div class="cee-panel active" data-panel="tab-anim">
+        <div class="cee-controls">
+            <label><b>Level:</b>
+                <select class="ui-lvl-select">
+                    <option value="1">Level 1 (90 km/h, -2.9 m/s²)</option>
+                    <option value="2">Level 2 (100 km/h, -3.4 m/s²)</option>
+                    <option value="3" selected>Level 3 (110 km/h, -4.6 m/s²)</option>
+                    <option value="4">Level 4 (120 km/h, -6.1 m/s²)</option>
+                    <option value="5">Level 5 (130 km/h, -6.5 m/s²)</option>
+                </select>
+            </label>
+            <label><b>Case:</b>
+                <select class="ui-case-select"></select>
+            </label>
+            <button class="purple-btn ui-cutoff-btn">Jump to Cut-Off</button>
+            <button class="warn-btn ui-coll-btn">Collision Case</button>
+            <button class="play-btn ui-play-btn">Play</button>
+            <label><b>Time: <span class="ui-time-label">0.0</span>s</b>
+                <input type="range" class="ui-time-slider" min="0" max="199" value="0" style="width:180px; vertical-align:middle;">
+            </label>
+            <label><b>Speed:</b>
+                <select class="ui-speed-select">
+                    <option value="1" selected>1.0x</option>
+                    <option value="2">2.0x</option>
+                    <option value="5">5.0x</option>
+                    <option value="10">10.0x</option>
+                </select>
+            </label>
+        </div>
+
+        <div class="cee-kpi-grid">
+            <div class="cee-kpi"><div class="cee-kpi-label">Free-Flow / Brake</div><div class="cee-kpi-val kpi-uf">-</div></div>
+            <div class="cee-kpi"><div class="cee-kpi-label">Cut-Off & Target Speed</div><div class="cee-kpi-val kpi-bwin" style="color:#dc2626;">-</div></div>
+            <div class="cee-kpi"><div class="cee-kpi-label">Max Mainline Queue</div><div class="cee-kpi-val kpi-qmax" style="color:#2563eb;">-</div></div>
+            <div class="cee-kpi"><div class="cee-kpi-label">Mean Queue Speed</div><div class="cee-kpi-val kpi-qspd">-</div></div>
+            <div class="cee-kpi"><div class="cee-kpi-label">Shockwave Speed</div><div class="cee-kpi-val kpi-sw">-</div></div>
+            <div class="cee-kpi"><div class="cee-kpi-label">Rear-End Collisions</div><div class="cee-kpi-val kpi-coll">-</div></div>
+        </div>
+
+        <canvas class="cee-canvas highway-full-canvas"></canvas>
+        <canvas class="cee-canvas highway-zoom-canvas"></canvas>
+    </div>
+
+    <div class="cee-panel" data-panel="tab-stats">
+        <div class="cee-stats-bar">
+            <h4 style="margin:0;">Aggregate Statistical Summary Across 50 Test Cases (10 Runs per Level)</h4>
+            <button class="cee-png-btn ui-download-png">Download Plots</button>
+        </div>
+        <div class="stats-table-container" style="margin-bottom:14px;"></div>
+        <canvas class="cee-canvas summary-charts-canvas"></canvas>
+    </div>
+
+    <div class="cee-panel" data-panel="tab-browser">
+        <div style="margin-bottom:8px; font-size:13px;">
+            <b>Filter by Aggression Level:</b>
+            <select class="browser-lvl-filter">
+                <option value="0">All 50 Cases</option>
+                <option value="1">Level 1 Only (10 cases)</option>
+                <option value="2">Level 2 Only (10 cases)</option>
+                <option value="3">Level 3 Only (10 cases)</option>
+                <option value="4">Level 4 Only (10 cases)</option>
+                <option value="5">Level 5 Only (10 cases)</option>
+            </select>
+        </div>
+        <div class="browser-table-container" style="max-height:420px; overflow-y:auto; border:1px solid #cbd5e1;"></div>
+    </div>
+</div>
+
+<script>
+(function() {{
+    const root = document.getElementById("{UID}");
+    if (!root) return;
+    const qs = (sel) => root.querySelector(sel);
+    const qsa = (sel) => root.querySelectorAll(sel);
+
+    const DATA = {json_payload};
+    let currentKey = "L3_C000";
+    let simTime = 0.0;
+    let isPlaying = false;
+    let rafId = null;
+    let lastRafTs = null;
+
+    const ZOOM_MIN_M = 1530.0;
+    const ZOOM_MAX_M = 2340.0;
+    const RAMP_ANGLE_RAD = 3.0 * Math.PI / 180.0;
+    const EXPORT_SCALE = 2;
+
+    function prepareHiDPICanvas(canvas, logicalW, logicalH) {{
+        const scale = Math.max(1, window.devicePixelRatio || 1) * EXPORT_SCALE;
+        const targetW = Math.round(logicalW * scale);
+        const targetH = Math.round(logicalH * scale);
+        if (canvas.width !== targetW || canvas.height !== targetH) {{
+            canvas.width = targetW;
+            canvas.height = targetH;
+        }}
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        return ctx;
+    }}
+
+    qsa('.cee-tab-btn').forEach(btn => {{
+        btn.addEventListener('click', () => {{
+            const tabId = btn.getAttribute('data-tab');
+            qsa('.cee-panel').forEach(p => p.classList.remove('active'));
+            qsa('.cee-tab-btn').forEach(b => b.classList.remove('active'));
+            qs(`.cee-panel[data-panel="${{tabId}}"]`).classList.add('active');
+            btn.classList.add('active');
+            if (tabId === 'tab-stats') drawSummaryCharts();
+            if (tabId === 'tab-browser') renderBrowserTable();
+        }});
+    }});
+
+    qs('.ui-download-png').addEventListener('click', () => {{
+        drawSummaryCharts();
+        const canvas = qs('.summary-charts-canvas');
+        const link = document.createElement('a');
+        link.download = 'summary_charts_highres.png';
+        link.href = canvas.toDataURL('image/png', 1.0);
+        link.click();
+    }});
+
+    function populateCaseSelect(lvl) {{
+        const sel = qs('.ui-case-select');
+        sel.innerHTML = '';
+        Object.keys(DATA.recorded_cases).filter(k => k.startsWith('L' + lvl + '_')).forEach(k => {{
+            const s = DATA.recorded_cases[k].summary;
+            const opt = document.createElement('option');
+            opt.value = k;
+            opt.textContent = `Case #${{s.Case_ID}} (Ramp Sent: ${{s.Ramp_Released}} | Cut-Off @ ${{s.Brake_Start_s}}s | Crashes: ${{s.Total_Collisions}})`;
+            sel.appendChild(opt);
+        }});
+        currentKey = sel.value;
+    }}
+
+    function onCaseChange() {{
+        currentKey = qs('.ui-case-select').value;
+        const cData = DATA.recorded_cases[currentKey];
+        const s = cData.summary;
+        qs('.kpi-uf').textContent = `${{s.Free_Flow_kmh}} km/h | -${{s.Init_Brake_mps2}} m/s²`;
+        qs('.kpi-bwin').textContent = `${{s.Brake_Start_s}}s -> ${{s.Target_Safe_Speed_kmh}} km/h`;
+        qs('.kpi-qmax').textContent = `${{s.Max_Mainline_Queue_veh}} veh`;
+        qs('.kpi-qspd').textContent = `${{s.Mean_Queue_Speed_kmh}} km/h`;
+        qs('.kpi-sw').textContent = `${{s.Empirical_Shockwave_kmh}} km/h`;
+        qs('.kpi-coll').textContent = s.Total_Collisions > 0 ? `${{s.Total_Collisions}} Crashes` : `0 (Safe)`;
+        qs('.kpi-coll').style.color = s.Total_Collisions > 0 ? '#dc2626' : '#16a34a';
+
+        const targetStartT = Math.max(0.0, s.Ramp_Start_s - 4.0);
+        const startIdx = Math.max(0, cData.frames.findIndex(f => f.t >= targetStartT));
+        simTime = cData.frames[startIdx].t;
+        const slider = qs('.ui-time-slider');
+        slider.max = cData.frames.length - 1;
+        slider.value = startIdx;
+        renderAtTime(simTime);
+    }}
+
+    function rafLoop(ts) {{
+        if (!isPlaying) return;
+        if (lastRafTs === null) lastRafTs = ts;
+        const dtReal = Math.min(0.1, (ts - lastRafTs) / 1000.0);
+        lastRafTs = ts;
+
+        const speedMult = parseFloat(qs('.ui-speed-select').value);
+        const frames = DATA.recorded_cases[currentKey].frames;
+        const maxT = frames[frames.length - 1].t;
+
+        simTime += dtReal * speedMult;
+        if (simTime > maxT) simTime = 0.0;
+
+        renderAtTime(simTime);
+        rafId = requestAnimationFrame(rafLoop);
+    }}
+
+    function stopPlay() {{
+        isPlaying = false;
+        if (rafId) cancelAnimationFrame(rafId);
+        rafId = null;
+        lastRafTs = null;
+        const btn = qs('.ui-play-btn');
+        btn.textContent = 'Play';
+        btn.style.background = '#16a34a';
+    }}
+
+    qs('.ui-lvl-select').addEventListener('change', () => {{
+        populateCaseSelect(qs('.ui-lvl-select').value);
+        onCaseChange();
+    }});
+    qs('.ui-case-select').addEventListener('change', onCaseChange);
+    qs('.ui-time-slider').addEventListener('input', (e) => {{
+        const idx = parseInt(e.target.value, 10);
+        const frames = DATA.recorded_cases[currentKey].frames;
+        simTime = frames[idx].t;
+        renderAtTime(simTime);
+    }});
+    qs('.ui-cutoff-btn').addEventListener('click', () => {{
+        const cData = DATA.recorded_cases[currentKey];
+        const s = cData.summary;
+        simTime = Math.max(0.0, s.Brake_Start_s - 5.0);
+        renderAtTime(simTime);
+    }});
+    qs('.ui-coll-btn').addEventListener('click', () => {{
+        const lvl = qs('.ui-lvl-select').value;
+        const keys = Object.keys(DATA.recorded_cases).filter(k => k.startsWith('L' + lvl + '_'));
+        const hit = keys.find(k => DATA.recorded_cases[k].summary.Total_Collisions > 0) || keys[0];
+        qs('.ui-case-select').value = hit;
+        onCaseChange();
+    }});
+    qs('.ui-play-btn').addEventListener('click', () => {{
+        if (isPlaying) {{
+            stopPlay();
+        }} else {{
+            isPlaying = true;
+            lastRafTs = null;
+            const btn = qs('.ui-play-btn');
+            btn.textContent = 'Pause';
+            btn.style.background = '#d97706';
+            rafId = requestAnimationFrame(rafLoop);
+        }}
+    }});
+    qs('.browser-lvl-filter').addEventListener('change', renderBrowserTable);
+
+    function getInterpolatedFrame(frames, t) {{
+        let lo = 0, hi = frames.length - 1;
+        while (lo < hi - 1) {{
+            const mid = (lo + hi) >> 1;
+            if (frames[mid].t <= t) lo = mid;
+            else hi = mid;
+        }}
+        const f0 = frames[lo];
+        const f1 = frames[hi];
+        const span = f1.t - f0.t;
+        const alpha = span > 1e-6 ? Math.max(0, Math.min(1, (t - f0.t) / span)) : 0.0;
+
+        const map1 = new Map();
+        f1.vehs.forEach(v => map1.set(v[0], v));
+
+        const interpVehs = f0.vehs.map(v0 => {{
+            const v1 = map1.get(v0[0]);
+            if (!v1) return v0;
+            return [
+                v0[0],
+                v0[1] + (v1[1] - v0[1]) * alpha,
+                v0[2] + (v1[2] - v0[2]) * alpha,
+                alpha < 0.5 ? v0[3] : v1[3],
+                alpha < 0.5 ? v0[4] : v1[4],
+                v0[5],
+                v0[6] + (v1[6] - v0[6]) * alpha,
+                v0[7],
+                v0[8] + (v1[8] - v0[8]) * alpha
+            ];
+        }});
+
+        return {{
+            frameIdx: lo,
+            t: t,
+            q_main: f0.q_main,
+            q_ramp: f0.q_ramp,
+            r_sent: f0.r_sent,
+            meter: f0.meter,
+            braking: f0.braking,
+            vehs: interpVehs
+        }};
+    }}
+
+    function mapXFull(pos_m) {{
+        return 30 + (pos_m / 4000.0) * 1040;
+    }}
+
+    function mapXZoom(pos_m) {{
+        return 30 + ((pos_m - ZOOM_MIN_M) / (ZOOM_MAX_M - ZOOM_MIN_M)) * 1040;
+    }}
+
+    function drawRoadGeometry(ctx, mapFn, xLeft, xRight, yMainTop, laneH) {{
+        const xRampApproach = mapFn(1550.0);
+        const xMeterStop = mapFn(1690.0);
+        const xOnStart = mapFn(1695.0);
+        const xAuxStart = mapFn(1847.4);
+        const xAuxEnd = mapFn(2152.4);
+        const xOffEnd = mapFn(2304.8);
+
+        const rampDrop = (xAuxStart - xOnStart) * Math.tan(RAMP_ANGLE_RAD);
+        const shoulderH = Math.max(7, laneH * 0.65);
+
+        const yShoulderTop = yMainTop - shoulderH;
+        const yMainBot = yMainTop + laneH;
+        const yAuxBot = yMainBot + laneH;
+        const yRampInner = yMainBot + rampDrop;
+        const yRampOuter = yAuxBot + rampDrop;
+
+        ctx.fillStyle = '#64748b';
+        ctx.fillRect(xLeft, yShoulderTop, xRight - xLeft, shoulderH);
+
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(xLeft, yMainTop, xRight - xLeft, laneH);
+        ctx.fillRect(xAuxStart, yMainBot, xAuxEnd - xAuxStart, laneH);
+        ctx.fillRect(xRampApproach, yRampInner, xOnStart - xRampApproach, laneH);
+
+        ctx.beginPath();
+        ctx.moveTo(xOnStart, yRampInner);
+        ctx.lineTo(xAuxStart, yMainBot);
+        ctx.lineTo(xAuxStart, yAuxBot);
+        ctx.lineTo(xOnStart, yRampOuter);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(xAuxEnd, yMainBot);
+        ctx.lineTo(xOffEnd, yRampInner);
+        ctx.lineTo(xOffEnd, yRampOuter);
+        ctx.lineTo(xAuxEnd, yAuxBot);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.strokeStyle = '#0f172a';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(xLeft, yShoulderTop); ctx.lineTo(xRight, yShoulderTop);
+        ctx.moveTo(xLeft, yMainBot); ctx.lineTo(xAuxStart, yMainBot);
+        ctx.moveTo(xAuxEnd, yMainBot); ctx.lineTo(xRight, yMainBot);
+        ctx.moveTo(xRampApproach, yRampInner); ctx.lineTo(xOnStart, yRampInner); ctx.lineTo(xAuxStart, yMainBot);
+        ctx.moveTo(xRampApproach, yRampInner); ctx.lineTo(xRampApproach, yRampOuter); ctx.lineTo(xOnStart, yRampOuter); ctx.lineTo(xAuxStart, yAuxBot);
+        ctx.moveTo(xAuxStart, yAuxBot); ctx.lineTo(xAuxEnd, yAuxBot);
+        ctx.moveTo(xAuxEnd, yMainBot); ctx.lineTo(xOffEnd, yRampInner);
+        ctx.moveTo(xAuxEnd, yAuxBot); ctx.lineTo(xOffEnd, yRampOuter); ctx.lineTo(xOffEnd, yRampInner);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#facc15';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(xLeft, yMainTop); ctx.lineTo(xRight, yMainTop);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2.0;
+        ctx.beginPath();
+        ctx.moveTo(xMeterStop, yRampInner + 1);
+        ctx.lineTo(xMeterStop, yRampOuter - 1);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#f8fafc';
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([10, 7]);
+        ctx.beginPath();
+        ctx.moveTo(xAuxStart, yMainBot); ctx.lineTo(xAuxEnd, yMainBot);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        return {{
+            yShoulderCenter: yShoulderTop + shoulderH / 2,
+            yMainCenter: yMainTop + laneH / 2,
+            yAuxCenter: yMainBot + laneH / 2,
+            yRampStartCenter: yRampInner + laneH / 2,
+            xMeterStop, yRampOuter
+        }};
+    }}
+
+    function getVehColor(rv, uf, braking) {{
+        if (rv.is_crashed) return '#dc2626';
+        if (rv.role_flag === 1 && braking) return '#ea580c';
+        if (rv.role_flag === 2) return '#8b5cf6';
+        if (rv.lane_id === 2 && rv.pos_m <= 1690.5) return '#f97316';
+        if (rv.acc_mps2 < -0.3) return '#eab308';
+        if (rv.spd_kmh < uf * 0.45 && rv.acc_mps2 <= 0.25) return '#f97316';
+        return '#22c55e';
+    }}
+
+    function computeVehPosition(v, mapFn, geom) {{
+        const [id, pos_m, spd_kmh, lane_id, is_crashed, role_flag, lat_p, r_num, acc_mps2] = v;
+        let vx = mapFn(pos_m);
+        let vy = geom.yMainCenter;
+        let angleRad = 0.0;
+
+        if (lane_id === 4) {{
+            const frac = Math.min(1.0, Math.max(0.0, -lat_p));
+            vy = geom.yMainCenter - frac * (geom.yMainCenter - geom.yShoulderCenter);
+            if (frac > 0.05 && frac < 0.95) angleRad = -0.10;
+        }} else if (lane_id === 2 && pos_m < 1695.0) {{
+            vy = geom.yRampStartCenter;
+            angleRad = 0.0;
+        }} else if (lane_id === 2 && pos_m < 1847.4) {{
+            const frac = Math.max(0, Math.min(1, (pos_m - 1695.0) / 152.4));
+            vy = geom.yRampStartCenter + frac * (geom.yAuxCenter - geom.yRampStartCenter);
+            angleRad = -RAMP_ANGLE_RAD;
+        }} else if (lane_id === 3) {{
+            const frac = Math.max(0, Math.min(1, (pos_m - 2152.4) / 152.4));
+            vy = geom.yAuxCenter + frac * (geom.yRampStartCenter - geom.yAuxCenter);
+            angleRad = RAMP_ANGLE_RAD;
+        }} else {{
+            const effLat = (lane_id === 1 && pos_m >= 2152.4) ? 0.0 : lat_p;
+            vy = geom.yMainCenter + effLat * (geom.yAuxCenter - geom.yMainCenter);
+            if (effLat > 0.02 && effLat < 0.98) {{
+                angleRad = (lane_id === 1 && pos_m < 2080.0) ? -0.08 : 0.08;
+            }}
+        }}
+        return {{ id, pos_m, spd_kmh, lane_id, is_crashed, role_flag, lat_p, r_num, acc_mps2, vx, vy, angleRad }};
+    }}
+
+    function renderFullView(cData, frame) {{
+        const canvas = qs('.highway-full-canvas');
+        const ctx = prepareHiDPICanvas(canvas, 1100, 115);
+        ctx.clearRect(0, 0, 1100, 115);
+
+        ctx.fillStyle = '#f1f5f9';
+        ctx.fillRect(0, 0, 1100, 115);
+
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 12.5px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('FULL SEGMENT', 18, 22);
+
+        const legItems = [
+            ['#22c55e', 'Free-Flow / Accel'],
+            ['#eab308', 'Decelerating'],
+            ['#f97316', 'Queued'],
+            ['#8b5cf6', 'Cut-Off Merger'],
+            ['#dc2626', 'Crash']
+        ];
+        let lx = 585;
+        legItems.forEach(([col, lbl]) => {{
+            ctx.fillStyle = col;
+            ctx.fillRect(lx, 12, 11, 11);
+            ctx.strokeStyle = '#0f172a';
+            ctx.strokeRect(lx, 12, 11, 11);
+            ctx.fillStyle = '#334155';
+            ctx.font = '11px sans-serif';
+            ctx.fillText(lbl, lx + 15, 21);
+            lx += ctx.measureText(lbl).width + 24;
+        }});
+
+        const geom = drawRoadGeometry(ctx, mapXFull, mapXFull(0), mapXFull(4000), 54, 11);
+
+        const zx1 = mapXFull(ZOOM_MIN_M);
+        const zx2 = mapXFull(ZOOM_MAX_M);
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 1.3;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(zx1, 40, zx2 - zx1, 48);
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = frame.meter ? '#16a34a' : '#dc2626';
+        ctx.beginPath();
+        ctx.arc(geom.xMeterStop + 2, geom.yRampOuter + 6, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        const uf = cData.summary.Free_Flow_kmh;
+        frame.vehs.forEach(v => {{
+            if (v[3] === 3 && v[1] > 2304.8) return;
+            const rv = computeVehPosition(v, mapXFull, geom);
+            ctx.save();
+            ctx.translate(rv.vx, rv.vy);
+            ctx.rotate(rv.angleRad);
+            ctx.fillStyle = getVehColor(rv, uf, frame.braking);
+            ctx.strokeStyle = '#0f172a';
+            ctx.lineWidth = 0.8;
+            ctx.fillRect(-3.5, -2.0, 7, 4);
+            ctx.strokeRect(-3.5, -2.0, 7, 4);
+            ctx.restore();
+        }});
+    }}
+
+    function renderZoomView(cData, frame) {{
+        const canvas = qs('.highway-zoom-canvas');
+        const ctx = prepareHiDPICanvas(canvas, 1100, 160);
+        ctx.clearRect(0, 0, 1100, 160);
+
+        ctx.fillStyle = '#f1f5f9';
+        ctx.fillRect(0, 0, 1100, 160);
+
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 12.5px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('CLOSE UP', 18, 22);
+
+        const geom = drawRoadGeometry(ctx, mapXZoom, mapXZoom(ZOOM_MIN_M), mapXZoom(ZOOM_MAX_M), 60, 17);
+
+        ctx.fillStyle = frame.meter ? '#16a34a' : '#dc2626';
+        ctx.beginPath();
+        ctx.arc(geom.xMeterStop + 4, geom.yRampOuter + 10, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#0f172a';
+        ctx.lineWidth = 1.3;
+        ctx.stroke();
+
+        const uf = cData.summary.Free_Flow_kmh;
+        let renderVehs = [];
+        frame.vehs.forEach(v => {{
+            const pos_m = v[1];
+            const lane_id = v[3];
+            if (lane_id === 3 && pos_m > 2304.8) return;
+            if (pos_m < ZOOM_MIN_M - 15 || pos_m > ZOOM_MAX_M + 15) return;
+            renderVehs.push(computeVehPosition(v, mapXZoom, geom));
+        }});
+
+        renderVehs.sort((a, b) => b.vx - a.vx);
+        const minPxSpacing = 11.0;
+        for (let i = 1; i < renderVehs.length; i++) {{
+            for (let j = 0; j < i; j++) {{
+                if (Math.abs(renderVehs[i].vy - renderVehs[j].vy) < 6.5) {{
+                    if (renderVehs[j].vx - renderVehs[i].vx < minPxSpacing) {{
+                        renderVehs[i].vx = renderVehs[j].vx - minPxSpacing;
+                    }}
+                }}
+            }}
+        }}
+
+        renderVehs.forEach(rv => {{
+            ctx.save();
+            ctx.translate(rv.vx, rv.vy);
+            ctx.rotate(rv.angleRad);
+            ctx.fillStyle = getVehColor(rv, uf, frame.braking);
+            ctx.strokeStyle = '#0f172a';
+            ctx.lineWidth = 1.0;
+            ctx.fillRect(-5, -2.8, 10, 5.6);
+            ctx.strokeRect(-5, -2.8, 10, 5.6);
+            ctx.fillStyle = '#e2e8f0';
+            ctx.fillRect(1.5, -2.0, 2.2, 4.0);
+
+            if (rv.is_crashed) {{
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.6;
+                ctx.beginPath();
+                ctx.moveTo(-3.8, -2.2); ctx.lineTo(3.8, 2.2);
+                ctx.moveTo(-3.8, 2.2); ctx.lineTo(3.8, -2.2);
+                ctx.stroke();
+            }}
+            ctx.restore();
+
+            if (rv.role_flag === 2 && !rv.is_crashed) {{
+                const inMergeOrBrake = (rv.lat_p > 0.05 && rv.lat_p < 0.95) ||
+                    (frame.t >= cData.summary.Brake_Start_s - 0.5 && frame.t <= cData.summary.Brake_Start_s + cData.summary.Brake_Duration_s + 2.0);
+                if (inMergeOrBrake) {{
+                    ctx.fillStyle = '#6d28d9';
+                    ctx.font = 'bold 10px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('MERGE AND BRAKE', rv.vx, rv.vy - 9);
+                }}
+            }}
+
+            if (rv.role_flag === 1 && frame.braking && !rv.is_crashed) {{
+                ctx.fillStyle = '#dc2626';
+                ctx.font = 'bold 10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('BRAKING', rv.vx, rv.vy - 8);
+            }}
+        }});
+    }}
+
+    function renderAtTime(t) {{
+        const cData = DATA.recorded_cases[currentKey];
+        const frame = getInterpolatedFrame(cData.frames, t);
+        qs('.ui-time-label').textContent = t.toFixed(1);
+        qs('.ui-time-slider').value = frame.frameIdx;
+
+        renderFullView(cData, frame);
+        renderZoomView(cData, frame);
+    }}
+
+    function renderStatsTable() {{
+        let html = `<table class="cee-table"><thead><tr>
+            <th>Aggression Level</th><th>Runs</th><th>Free-Flow Speed</th><th>Init Brake Decel</th>
+            <th>Mean Post-Cutoff Speed</th><th>Mean Max Queue</th><th>Mean Queue Speed</th>
+            <th>Empirical Shockwave</th><th>Greenshields Shockwave</th><th>Collision Prob (%)</th><th>Avg Collisions / Run</th>
+        </tr></thead><tbody>`;
+        DATA.level_summary.forEach(r => {{
+            html += `<tr>
+                <td><b>Level ${{r.Level}}</b></td><td>${{r.Cases}}</td><td>${{r.Free_Flow_kmh}} km/h</td>
+                <td>${{r.Init_Brake_mps2}} m/s²</td><td>${{r.Mean_Target_Safe_Speed_kmh}} km/h</td>
+                <td>${{r.Mean_Max_Queue_veh}} ± ${{r.Std_Max_Queue_veh}} veh</td>
+                <td>${{r.Mean_Queue_Speed_kmh}} km/h</td><td>${{r.Empirical_Shockwave_kmh}} km/h</td>
+                <td>${{r.Greenshields_Shockwave_kmh}} km/h</td><td><b>${{r.Collision_Prob_Pct}}%</b></td>
+                <td>${{r.Avg_Collisions_Per_Case}}</td>
+            </tr>`;
+        }});
+        html += `</tbody></table>`;
+        qs('.stats-table-container').innerHTML = html;
+    }}
+
+    function drawSummaryCharts() {{
+        const canvas = qs('.summary-charts-canvas');
+        const ctx = prepareHiDPICanvas(canvas, 1100, 350);
+        ctx.clearRect(0, 0, 1100, 350);
+
+        const lvls = DATA.level_summary;
+
+        // ---------------- Left Plot: Queue Length & Avg Collisions ----------------
+        const p1L = 75, p1T = 52, p1W = 425, p1H = 235;
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('Mean Max Queue (veh) & Avg Collisions Across Levels 1-5', p1L, 22);
+
+        ctx.fillStyle = '#2563eb';
+        ctx.fillRect(p1L, 31, 12, 10);
+        ctx.fillStyle = '#334155';
+        ctx.font = '11px sans-serif';
+        ctx.fillText('Mean Max Queue (veh)', p1L + 16, 40);
+
+        ctx.fillStyle = '#dc2626';
+        ctx.fillRect(p1L + 165, 31, 12, 10);
+        ctx.fillStyle = '#334155';
+        ctx.fillText('Avg Collisions / Run', p1L + 181, 40);
+
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(p1L, p1T, p1W, p1H);
+
+        [0, 5, 10, 15, 20, 25].forEach(val => {{
+            const y = p1T + p1H - (val / 25.0) * p1H;
+            ctx.strokeStyle = val === 0 ? '#94a3b8' : '#e2e8f0';
+            ctx.beginPath(); ctx.moveTo(p1L, y); ctx.lineTo(p1L + p1W, y); ctx.stroke();
+            ctx.fillStyle = '#475569';
+            ctx.font = '10.5px sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillText(`${{val}}`, p1L - 7, y + 3.5);
+        }});
+
+        ctx.save();
+        ctx.translate(22, p1T + p1H / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 11.5px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Count (vehicles / crashes)', 0, 0);
+        ctx.restore();
+
+        lvls.forEach((r, idx) => {{
+            const slotW = p1W / lvls.length;
+            const cx = p1L + idx * slotW + slotW / 2;
+            const qH = (r.Mean_Max_Queue_veh / 25.0) * p1H;
+            const cH = (r.Avg_Collisions_Per_Case / 25.0) * p1H;
+
+            ctx.fillStyle = '#2563eb';
+            ctx.fillRect(cx - 22, p1T + p1H - qH, 20, qH);
+            ctx.fillStyle = '#1e3a8a';
+            ctx.font = 'bold 10px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${{r.Mean_Max_Queue_veh}}`, cx - 12, p1T + p1H - qH - 4);
+
+            ctx.fillStyle = '#dc2626';
+            ctx.fillRect(cx + 2, p1T + p1H - cH, 20, cH);
+            ctx.fillStyle = '#991b1b';
+            ctx.fillText(`${{r.Avg_Collisions_Per_Case}}`, cx + 12, p1T + p1H - cH - 4);
+
+            ctx.fillStyle = '#334155';
+            ctx.font = '11px sans-serif';
+            ctx.fillText(`Level ${{r.Level}}`, cx, p1T + p1H + 16);
+        }});
+
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 11.5px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Driver Aggression Level', p1L + p1W / 2, p1T + p1H + 34);
+
+        // ---------------- Right Plot: Collision Probability (%) ----------------
+        const p2L = 615, p2T = 52, p2W = 445, p2H = 235;
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('Rear-End Collision Probability (%) vs. Driver Aggression Level', p2L, 22);
+
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(p2L, p2T, p2W, p2H);
+
+        [0, 20, 40, 60, 80, 100].forEach(pct => {{
+            const y = p2T + p2H - (pct / 100.0) * p2H;
+            ctx.strokeStyle = pct === 0 ? '#94a3b8' : '#e2e8f0';
+            ctx.beginPath(); ctx.moveTo(p2L, y); ctx.lineTo(p2L + p2W, y); ctx.stroke();
+            ctx.fillStyle = '#475569';
+            ctx.font = '10.5px sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillText(`${{pct}}%`, p2L - 7, y + 3.5);
+        }});
+
+        ctx.save();
+        ctx.translate(562, p2T + p2H / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 11.5px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Collision Probability (%)', 0, 0);
+        ctx.restore();
+
+        lvls.forEach((r, idx) => {{
+            const slotW = p2W / lvls.length;
+            const cx = p2L + idx * slotW + slotW / 2;
+            const bH = (r.Collision_Prob_Pct / 100.0) * p2H;
+
+            ctx.fillStyle = '#ea580c';
+            ctx.fillRect(cx - 18, p2T + p2H - bH, 36, bH);
+
+            ctx.fillStyle = '#0f172a';
+            ctx.font = 'bold 11px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${{r.Collision_Prob_Pct}}%`, cx, p2T + p2H - bH - 6);
+
+            ctx.fillStyle = '#334155';
+            ctx.font = '11px sans-serif';
+            ctx.fillText(`Level ${{r.Level}}`, cx, p2T + p2H + 16);
+        }});
+
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 11.5px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Driver Aggression Level', p2L + p2W / 2, p2T + p2H + 34);
+    }}
+
+    function renderBrowserTable() {{
+        const flt = parseInt(qs('.browser-lvl-filter').value, 10);
+        const rows = DATA.all_500_summary.filter(r => flt === 0 || r.Level === flt);
+        let html = `<table class="cee-table"><thead><tr>
+            <th>Scenario</th><th>Level</th><th>Ramp Sent</th><th>Cut-Off Time (s)</th><th>Post-Cutoff Speed (km/h)</th>
+            <th>Max Queue (veh)</th><th>Mean Queue Speed (km/h)</th><th>Shockwave (km/h)</th>
+            <th>Total Collisions</th><th>Mean Ramp Wait (s)</th>
+        </tr></thead><tbody>`;
+        rows.forEach(r => {{
+            html += `<tr>
+                <td><b>${{r.Scenario_Key}}</b></td><td>${{r.Level}}</td><td>${{r.Ramp_Released}}</td>
+                <td>${{r.Brake_Start_s}}s</td><td>${{r.Target_Safe_Speed_kmh}}</td>
+                <td>${{r.Max_Mainline_Queue_veh}}</td><td>${{r.Mean_Queue_Speed_kmh}}</td>
+                <td>${{r.Empirical_Shockwave_kmh}}</td>
+                <td style="color:${{r.Total_Collisions > 0 ? '#dc2626' : '#16a34a'}}; font-weight:700;">${{r.Total_Collisions}}</td>
+                <td>${{r.Mean_Ramp_Wait_s}}s</td>
+            </tr>`;
+        }});
+        html += `</tbody></table>`;
+        qs('.browser-table-container').innerHTML = html;
+    }}
+
+    populateCaseSelect(3);
+    renderStatsTable();
+    onCaseChange();
+}})();
+</script>
+"""
+
+display(HTML(html_app))
